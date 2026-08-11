@@ -8,8 +8,13 @@ API Express yang dapat dijalankan lokal maupun dideploy ke Vercel.
 2. Tambahkan Environment Variable berikut di **Project Settings → Environment Variables**:
 
    ```text
-   BASE_API=https://animeinweb.com/api/proxy/3/2
+   BASE_API=https://xyz-api.animein.net/3/2
    ```
+
+   > Jangan pakai `https://animeinweb.com/api/proxy/3/2` — route proxy tersebut
+   > memblokir akses langsung dari server dengan status **403** ("Forbidden: Direct
+   > API Proxy access is blocked"). Gunakan endpoint API langsung
+   > `https://xyz-api.animein.net/3/2` yang sudah terbukti jalan.
 
    Terapkan ke environment Production (dan Preview bila diperlukan).
 3. Deploy.
