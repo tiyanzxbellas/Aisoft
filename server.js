@@ -247,6 +247,12 @@ app.use((req, res) => {
   });
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+// Vercel menjalankan `app` sebagai serverless function melalui api/index.js.
+// Listener ini hanya dipakai ketika aplikasi dijalankan langsung (npm start).
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}
+
+export default app;
