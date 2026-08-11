@@ -118,7 +118,6 @@ export async function proxyFetch(targetUrl, opts = {}) {
       'User-Agent': ua.ua,
       'Accept': 'application/json, text/plain, */*',
       'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Accept-Encoding': 'gzip, deflate, br',
       'Origin': originUrl,
       'Referer': `${originUrl}/`,
       'X-Requested-With': 'XMLHttpRequest',
