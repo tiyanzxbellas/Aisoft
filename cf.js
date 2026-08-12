@@ -1,3 +1,7 @@
+// Satu-satunya pintu keluar request ke upstream.
+// server.js / api/index.js tidak boleh fetch sendiri — semua lewat proxyFetch / proxyStream.
+// Host animein kena Cloudflare JS challenge dari IP datacenter, jadi path utama
+// adalah CORS worker (CF_PROXY) + header browser di bawah.
 import { request, Agent, setGlobalDispatcher, interceptors } from 'undici';
 import tls from 'tls';
 
@@ -23,6 +27,18 @@ const UA_POOL = [
     pf: '"Windows"'
   }
 ];
+
+const DEFAULT_CF_PROXY = 'https://cf.tiyanstores.workers.dev/';
+const DEFAULT_PROXY_SECRET = 'animein-secure-proxy-key-123';
+const CF_PROTECTED_HOSTS = /(^|\.)animein\.net$|(^|\.)animeinweb\.com$/i;
+
+function getCfProxy() {
+  return (process.env.CF_PROXY || DEFAULT_CF_PROXY).replace(/\/?$/, '/');
+}
+
+function getProxySecret() {
+  return process.env.PROXY_SECRET || DEFAULT_PROXY_SECRET;
+}
 
 const defaultCiphers = tls.DEFAULT_CIPHERS.split(':');
 const shuffledCiphers = [
@@ -55,144 +71,152 @@ function pickUA() {
   return UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
 }
 
-// Simple in-memory cookie jar for Cloudflare
-let cachedCfCookies = null;
-let cachedCfCookiesTime = 0;
+export function viaWorker(targetUrl) {
+  return `${getCfProxy()}?url=${encodeURIComponent(targetUrl)}`;
+}
 
-async function getCfCookies(baseOrigin) {
-  // Cache for 5 minutes
-  if (cachedCfCookies && Date.now() - cachedCfCookiesTime < 5 * 60 * 1000) {
-    return cachedCfCookies;
+export function isProtectedHost(targetUrl) {
+  try {
+    return CF_PROTECTED_HOSTS.test(new URL(targetUrl).hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function isCloudflareChallenge(statusCode, text = '') {
+  if (![403, 429, 503].includes(Number(statusCode))) return false;
+  return /just a moment|cf-chl|challenge-platform|cdn-cgi\/challenge|enable javascript and cookies|_cf_chl_opt/i.test(String(text));
+}
+
+function browserHeaders(targetUrl, extra = {}) {
+  const ua = pickUA();
+  const urlObj = new URL(targetUrl);
+  const originUrl = `${urlObj.protocol}//${urlObj.host}`;
+  return {
+    'User-Agent': ua.ua,
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Origin': originUrl,
+    'Referer': `${originUrl}/`,
+    'X-Requested-With': 'XMLHttpRequest',
+    'X-Proxy-Secret': extra.secret || getProxySecret(),
+    'Sec-Ch-Ua': ua.ch,
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': ua.pf,
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+    'Connection': 'keep-alive',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    ...extra.headers
+  };
+}
+
+function buildAttempts(targetUrl, opts = {}) {
+  const attempts = [];
+  const workerFirst = opts.forceWorker || isProtectedHost(targetUrl);
+
+  if (workerFirst) {
+    attempts.push({ kind: 'worker', url: viaWorker(targetUrl) });
+    if (!opts.workerOnly) attempts.push({ kind: 'direct', url: targetUrl });
+  } else {
+    attempts.push({ kind: 'direct', url: targetUrl });
+    attempts.push({ kind: 'worker', url: viaWorker(targetUrl) });
+  }
+
+  return attempts;
+}
+
+function summarizeError(statusCode, text) {
+  if (isCloudflareChallenge(statusCode, text)) {
+    return `Cloudflare challenge (Just a moment...) [status ${statusCode}]`;
   }
   try {
-    const ua = pickUA();
-    const { headers } = await request(baseOrigin, {
-      method: 'GET',
-      headers: {
-        'User-Agent': ua.ua,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Sec-Ch-Ua': ua.ch,
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': ua.pf,
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Upgrade-Insecure-Requests': '1'
-      },
-      headersTimeout: 3000,
-      bodyTimeout: 3000,
-    });
-    const setCookie = headers['set-cookie'];
-    if (setCookie) {
-      const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
-      const cookieStr = cookies.map(c => c.split(';')[0]).join('; ');
-      cachedCfCookies = cookieStr;
-      cachedCfCookiesTime = Date.now();
-      return cookieStr;
-    }
-  } catch (e) {
-    // ignore
-  }
-  return null;
+    const parsed = JSON.parse(text);
+    if (parsed?.message) return `${parsed.message} (status ${statusCode})`;
+  } catch { /* ignore */ }
+  const snippet = String(text || '').replace(/\s+/g, ' ').slice(0, 240);
+  return snippet ? `Target returned status ${statusCode}: ${snippet}` : `Target returned status ${statusCode}`;
+}
+
+async function requestText(url, headers, timeouts = {}) {
+  const { statusCode, headers: resHeaders, body } = await request(url, {
+    method: 'GET',
+    headers,
+    headersTimeout: timeouts.headersTimeout ?? 10000,
+    bodyTimeout: timeouts.bodyTimeout ?? 20000
+  });
+  const text = await body.text();
+  return { statusCode, resHeaders, text };
 }
 
 export async function proxyFetch(targetUrl, opts = {}) {
-  const urlObj = new URL(targetUrl);
-  const originUrl = `${urlObj.protocol}//${urlObj.host}`;
-  const customSecret = opts.secret || process.env.PROXY_SECRET || 'animein-secure-proxy-key-123';
-  const extraHeaders = opts.headers || {};
-
+  const attempts = buildAttempts(targetUrl, opts);
   let lastErr = null;
-  let cfCookies = null;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const ua = pickUA();
-    // Only fetch cookies after first 403 attempt to avoid overhead
-    if (attempt > 0) {
-      cfCookies = await getCfCookies(originUrl).catch(() => null);
-    }
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const headers = browserHeaders(targetUrl, {
+      secret: opts.secret,
+      headers: opts.headers
+    });
 
-    const headers = {
-      'Host': urlObj.host,
-      'User-Agent': ua.ua,
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Origin': originUrl,
-      'Referer': `${originUrl}/`,
-      'X-Requested-With': 'XMLHttpRequest',
-      'X-Proxy-Secret': customSecret,
-      'Sec-Ch-Ua': ua.ch,
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': ua.pf,
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-origin',
-      'Connection': 'keep-alive',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-      ...extraHeaders
-    };
-
-    if (cfCookies) {
-      headers['Cookie'] = cfCookies;
+    if (attempt.kind === 'direct') {
+      headers.Host = new URL(targetUrl).host;
     }
 
     try {
-      const { statusCode, headers: resHeaders, body } = await request(targetUrl, {
-        method: 'GET',
-        headers,
-        headersTimeout: 5000,
-        bodyTimeout: 8000,
-      });
-
-      const text = await body.text();
+      const { statusCode, resHeaders, text } = await requestText(attempt.url, headers);
 
       if (statusCode === 200) {
         try {
           return JSON.parse(text);
         } catch {
-          // Not JSON, return raw
           return { raw: text };
         }
       }
 
-      // Try to parse error body
-      let parsed = null;
-      try {
-        parsed = JSON.parse(text);
-      } catch {}
-
-      const errMsg = parsed?.message || text?.slice(0, 500) || `Status ${statusCode}`;
-      const err = new Error(parsed?.message ? `${parsed.message} (status ${statusCode})` : `Target returned status ${statusCode}: ${errMsg}`);
+      const err = new Error(summarizeError(statusCode, text));
       err.statusCode = statusCode;
-      err.body = parsed || text;
+      err.via = attempt.kind;
       err.headers = resHeaders;
-
-      // If 403 and message contains "Direct API Proxy access is blocked", we should retry with different strategy
-      if (statusCode === 403 && attempt < 2) {
-        // Rotate secret attempts, clear cookie cache and retry
-        cachedCfCookies = null;
-        await sleep(300 + attempt * 500);
-        lastErr = err;
-        continue;
+      try {
+        err.body = JSON.parse(text);
+      } catch {
+        err.body = String(text || '').slice(0, 400);
       }
 
+      lastErr = err;
+
+      const retryable = isCloudflareChallenge(statusCode, text) || statusCode === 403 || statusCode >= 500;
+      if (retryable && i < attempts.length - 1) {
+        await sleep(200 + i * 300);
+        continue;
+      }
       throw err;
     } catch (err) {
-      if (err.statusCode) throw err; // already handled
+      if (!err.statusCode) {
+        lastErr = new Error(`${attempt.kind} fetch failed: ${err.message}`);
+        lastErr.via = attempt.kind;
+        if (i < attempts.length - 1) {
+          await sleep(250 + i * 350);
+          continue;
+        }
+        throw lastErr;
+      }
       lastErr = err;
-      if (attempt < 2) {
-        await sleep(400 + attempt * 600);
+      if (i < attempts.length - 1) {
+        await sleep(200 + i * 300);
         continue;
       }
-      throw new Error(`Target fetch failed after ${attempt + 1} attempts: ${err.message}`);
+      throw err;
     }
   }
-  throw lastErr;
+
+  throw lastErr || new Error('Target fetch failed on all paths');
 }
 
-// Generic JSON fetch with retries for fallback APIs like Jikan (no special headers)
 export async function fetchJson(url, options = {}) {
   const ua = pickUA();
   let lastErr = null;
@@ -207,7 +231,7 @@ export async function fetchJson(url, options = {}) {
           ...options.headers
         },
         headersTimeout: 5000,
-        bodyTimeout: 8000,
+        bodyTimeout: 8000
       });
       const txt = await body.text();
       if (statusCode !== 200) {
@@ -223,43 +247,65 @@ export async function fetchJson(url, options = {}) {
 }
 
 export async function proxyStream(targetUrl, incomingHeaders = {}) {
-  const ua = pickUA();
-  const urlObj = new URL(targetUrl);
-  const cfCookies = await getCfCookies(`${urlObj.protocol}//${urlObj.host}`).catch(() => null);
+  const attempts = buildAttempts(targetUrl);
+  let lastErr = null;
 
-  const headersToSend = {
-    'Host': urlObj.host,
-    'User-Agent': ua.ua,
-    'Accept': incomingHeaders['accept'] || '*/*',
-    'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Origin': 'https://animeinweb.com',
-    'Referer': 'https://animeinweb.com/',
-    'X-Requested-With': 'XMLHttpRequest',
-    'X-Proxy-Secret': process.env.PROXY_SECRET || 'animein-secure-proxy-key-123',
-    'Sec-Ch-Ua': ua.ch,
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': ua.pf,
-    'Sec-Fetch-Dest': 'video',
-    'Sec-Fetch-Mode': 'no-cors',
-    'Sec-Fetch-Site': 'cross-site',
-    'Connection': 'keep-alive'
-  };
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const ua = pickUA();
+    const urlObj = new URL(targetUrl);
 
-  if (cfCookies) headersToSend['Cookie'] = cfCookies;
-  if (incomingHeaders['range']) headersToSend['Range'] = incomingHeaders['range'];
+    const headersToSend = {
+      'User-Agent': ua.ua,
+      'Accept': incomingHeaders.accept || incomingHeaders['accept'] || '*/*',
+      'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Origin': 'https://animeinweb.com',
+      'Referer': 'https://animeinweb.com/',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Proxy-Secret': getProxySecret(),
+      'Sec-Ch-Ua': ua.ch,
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': ua.pf,
+      'Sec-Fetch-Dest': 'video',
+      'Sec-Fetch-Mode': 'no-cors',
+      'Sec-Fetch-Site': 'cross-site',
+      'Connection': 'keep-alive'
+    };
 
-  try {
-    const { statusCode, headers, body } = await request(targetUrl, {
-      method: 'GET',
-      headers: headersToSend,
-    });
-    return { statusCode, headers, body };
-  } catch (err) {
-    throw err;
+    if (attempt.kind === 'direct') {
+      headersToSend.Host = urlObj.host;
+    }
+    if (incomingHeaders.range || incomingHeaders.Range) {
+      headersToSend.Range = incomingHeaders.range || incomingHeaders.Range;
+    }
+
+    try {
+      const { statusCode, headers, body } = await request(attempt.url, {
+        method: 'GET',
+        headers: headersToSend
+      });
+
+      if ([403, 429, 503].includes(Number(statusCode)) && i < attempts.length - 1) {
+        try { body.dump(); } catch { /* ignore */ }
+        lastErr = new Error(`Blocked status ${statusCode} on ${attempt.kind} stream`);
+        lastErr.statusCode = statusCode;
+        continue;
+      }
+
+      return { statusCode, headers, body, via: attempt.kind };
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts.length - 1) {
+        await sleep(200);
+        continue;
+      }
+      throw err;
+    }
   }
+
+  throw lastErr || new Error('Stream failed on all paths');
 }
 
-// Helper for debugging secret rotation (used by /v1/debug endpoint)
 export async function testSecrets(targetUrl, secrets) {
   const results = [];
   for (const sec of secrets) {
@@ -267,8 +313,15 @@ export async function testSecrets(targetUrl, secrets) {
       const data = await proxyFetch(targetUrl, { secret: sec });
       results.push({ secret: sec, success: true, status: 200, sample: JSON.stringify(data).slice(0, 200) });
     } catch (e) {
-      results.push({ secret: sec, success: false, status: e.statusCode || 0, message: e.message, body: e.body });
+      results.push({ secret: sec, success: false, status: e.statusCode || 0, via: e.via, message: e.message, body: e.body });
     }
   }
   return results;
+}
+
+export function getProxyConfig() {
+  return {
+    cf_proxy: getCfProxy(),
+    proxy_secret_set: Boolean(process.env.PROXY_SECRET)
+  };
 }
