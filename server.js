@@ -1,12 +1,21 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import { proxyFetch, proxyStream, fetchJson, testSecrets } from './cf.js';
+import { proxyFetch, proxyStream, fetchJson, testSecrets, getProxyConfig } from './cf.js';
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
-const BASE_API = process.env.BASE_API || 'https://animeinweb.com/api/proxy/3/2';
+const BASE_API = process.env.BASE_API || 'https://xyz-api.animein.net/3/2';
+
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // ---- Fallback data ----
 const FALLBACK_GENRES = [
@@ -153,11 +162,13 @@ app.get('/', (req, res) => {
 
 app.get('/v1/health', async (req, res) => {
   const checks = {};
+  const proxy = getProxyConfig();
   try {
     const r = await proxyFetch(`${BASE_API}/explore/genre`);
-    checks.upstream = { ok: true, sample: Object.keys(r).slice(0, 5) };
+    const genreCount = r.data?.genre?.length || 0;
+    checks.upstream = { ok: true, genre_count: genreCount, keys: Object.keys(r).slice(0, 5) };
   } catch (e) {
-    checks.upstream = { ok: false, error: e.message, status: e.statusCode || null, body: e.body || null };
+    checks.upstream = { ok: false, error: e.message, status: e.statusCode || null, via: e.via || null };
   }
   try {
     const j = await fetchJson('https://api.jikan.moe/v4/genres/anime');
@@ -165,7 +176,13 @@ app.get('/v1/health', async (req, res) => {
   } catch (e) {
     checks.jikan = { ok: false, error: e.message };
   }
-  res.json({ status: true, base_api: BASE_API, checks, fallback_genres_count: FALLBACK_GENRES.length });
+  res.json({
+    status: true,
+    base_api: BASE_API,
+    cf_proxy: proxy.cf_proxy,
+    checks,
+    fallback_genres_count: FALLBACK_GENRES.length
+  });
 });
 
 // Debug endpoint to test secret rotation from Vercel network (allows fetch_page tool to brute force)
